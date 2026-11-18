@@ -126,7 +126,48 @@ s, b = call("POST", f"/batches/{bid3}/publish", {"catch_up_seq": 2})
 check("追平倒退409", s == 409 and b["code"] == "CATCHUP_REGRESSION")
 call("POST", f"/batches/{bid3}/abort")
 
-# 12. /docs 与 openapi
+# 12. 连续迁区链：只以整条链的最终状态为发布门槛
+s, b = call("POST", "/changes", {"seq": 5, "change_type": "move", "outlet_no": "O1", "district": "D"})
+check("链式迁区seq5生效", s == 201 and b["applied"] is True)
+s, b = call("POST", "/changes", {"seq": 6, "change_type": "move", "outlet_no": "O1", "district": "E"})
+check("链式迁区seq6生效", s == 201 and b["applied"] is True)
+
+v3_snapshot_base = [
+    {"outlet_no": "O2", "district": "A", "active": False},
+    {"outlet_no": "O3", "district": "B", "active": False},
+    {"outlet_no": "O4", "district": "C", "active": False},
+    {"outlet_no": "O5", "district": "B", "active": True},
+]
+# 快照只到中间态 D（缺链尾 E）-> 拒绝，旧版不动
+s, b = call("POST", "/batches", {"total_shards": 1, "source_cutoff_seq": 4})
+bid4 = b["batch_id"]
+call("POST", f"/batches/{bid4}/shards", {"shard_no": 1, "items": [
+    {"outlet_no": "O1", "district": "D", "active": True},
+] + v3_snapshot_base})
+s, b = call("POST", f"/batches/{bid4}/publish", {"catch_up_seq": 4})
+check("中间态快照拒绝", s == 422 and b["code"] == "SNAPSHOT_MISSING_LIVE_CHANGE"
+      and b["details"]["seq"] == 6, str(b))
+s, outlets = call("GET", "/outlets")
+omap = {o["outlet_no"]: o for o in outlets["items"]}
+check("失败后旧版仍供最终状态E", outlets["version"] == 2 and omap["O1"]["district"] == "E")
+s, b = call("POST", f"/batches/{bid4}/abort")
+check("废弃失败批次", s == 200 and b["status"] == "aborted")
+
+# 快照含链尾最终状态 E：中间态 B/D 不再逐项核对，发布成功
+s, b = call("POST", "/batches", {"total_shards": 1, "source_cutoff_seq": 4})
+bid5 = b["batch_id"]
+call("POST", f"/batches/{bid5}/shards", {"shard_no": 1, "items": [
+    {"outlet_no": "O1", "district": "E", "active": True},
+] + v3_snapshot_base})
+s, b = call("POST", f"/batches/{bid5}/publish", {"catch_up_seq": 4})
+check("最终状态快照发布v3", s == 200 and b["version"] == 3, str(b))
+s, outlets = call("GET", "/outlets")
+omap = {o["outlet_no"]: o for o in outlets["items"]}
+check("v3保留链尾状态", omap["O1"]["district"] == "E" and omap["O1"]["active"] is True)
+s, b = call("GET", "/health")
+check("v3水位不倒退", b["version"] == 3 and b["last_served_seq"] == 4)
+
+# 13. /docs 与 openapi
 import urllib.request as u
 docs = u.urlopen(BASE + "/docs", timeout=5).status
 openapi = json.loads(u.urlopen(BASE + "/openapi.json", timeout=5).read().decode())

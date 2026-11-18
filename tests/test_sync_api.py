@@ -279,6 +279,150 @@ def test_changes_beyond_catchup_replay_onto_new_version(client):
 
 # ---------- 5. 发布门禁 ----------
 
+def test_publish_chain_relocation_judged_by_final_state(client):
+    # 连续迁区 A->B->C 均已套旧版：新快照的 X 已在最终状态 C，不得因不在中间态 B 被拒
+    bid = open_batch(client, 1, 0)
+    shard(client, bid, 1, [
+        {"outlet_no": "X", "district": "A", "active": True},
+        {"outlet_no": "Y", "district": "A", "active": True},
+    ])
+    publish(client, bid, 0)
+
+    assert change(client, 1, "move", "X", district="B").json()["applied"] is True
+    assert change(client, 2, "move", "X", district="C").json()["applied"] is True
+    row = [o for o in client.get("/outlets").json()["items"] if o["outlet_no"] == "X"][0]
+    assert row["district"] == "C"
+
+    # 快照已在链尾状态 C：以整条链的最终状态核对，发布成功
+    bid2 = open_batch(client, 1, cutoff=0)
+    shard(client, bid2, 1, [
+        {"outlet_no": "X", "district": "C", "active": True},
+        {"outlet_no": "Y", "district": "A", "active": True},
+    ])
+    r = publish(client, bid2, 0)
+    assert r.status_code == 200, r.text
+    assert r.json()["version"] == 2
+    outlets = {o["outlet_no"]: o for o in client.get("/outlets").json()["items"]}
+    assert outlets["X"]["district"] == "C" and outlets["X"]["active"] is True
+    changes = {c["seq"]: c for c in client.get("/changes").json()["items"]}
+    assert changes[1]["applied"] and changes[2]["applied"]
+    assert all(not c["blocked"] for c in changes.values())
+
+
+def test_publish_chain_relocation_genuine_omission_rejected(client):
+    # 连续迁区 A->B->C：快照只到中间态 B（最终状态 C 真正遗漏）仍须拒绝
+    bid = open_batch(client, 1, 0)
+    shard(client, bid, 1, [{"outlet_no": "X", "district": "A", "active": True}])
+    publish(client, bid, 0)
+    change(client, 1, "move", "X", district="B")
+    change(client, 2, "move", "X", district="C")
+
+    bid2 = open_batch(client, 1, cutoff=0)
+    shard(client, bid2, 1, [{"outlet_no": "X", "district": "B", "active": True}])
+    r = publish(client, bid2, 0)
+    assert r.status_code == 422 and r.json()["code"] == "SNAPSHOT_MISSING_LIVE_CHANGE"
+    assert r.json()["details"]["seq"] == 2 and r.json()["details"]["outlet_no"] == "X"
+
+    # 旧版照常供数（含链尾状态 C），批次仍 open，水位未动
+    assert client.get("/stats").json()["version"] == 1
+    row = [o for o in client.get("/outlets").json()["items"] if o["outlet_no"] == "X"][0]
+    assert row["district"] == "C"
+    assert client.get("/batches/current").json()["batch_id"] == bid2
+    assert client.get("/health").json()["last_served_seq"] == 0
+
+    # 同一批次提高追平序号到 2：窗口 (0,2] 按序重放整条链，发布成功
+    r = publish(client, bid2, 2)
+    assert r.status_code == 200, r.text
+    assert r.json()["changes_applied"] == 2
+    row = [o for o in client.get("/outlets").json()["items"] if o["outlet_no"] == "X"][0]
+    assert row["district"] == "C"
+    assert client.get("/health").json()["last_served_seq"] == 2
+
+
+def test_publish_chain_move_then_deactivate_final_state(client):
+    # 先迁区再停用：链尾只含停用，最终状态是（新区, 停用）两者，缺一不可
+    bid = open_batch(client, 1, 0)
+    shard(client, bid, 1, [{"outlet_no": "X", "district": "A", "active": True}])
+    publish(client, bid, 0)
+    change(client, 1, "move", "X", district="B")
+    change(client, 2, "deactivate", "X")
+
+    # 快照只有迁区效果、缺停用 -> 拒绝
+    bid2 = open_batch(client, 1, cutoff=0)
+    shard(client, bid2, 1, [{"outlet_no": "X", "district": "B", "active": True}])
+    r = publish(client, bid2, 0)
+    assert r.status_code == 422 and r.json()["code"] == "SNAPSHOT_MISSING_LIVE_CHANGE"
+    assert r.json()["details"]["seq"] == 2
+    client.post(f"/batches/{bid2}/abort")
+
+    # 快照只有停用效果、缺迁区 -> 同样拒绝（中间态的区号部分并未被停用覆盖）
+    bid3 = open_batch(client, 1, cutoff=0)
+    shard(client, bid3, 1, [{"outlet_no": "X", "district": "A", "active": False}])
+    r = publish(client, bid3, 0)
+    assert r.status_code == 422 and r.json()["code"] == "SNAPSHOT_MISSING_LIVE_CHANGE"
+    client.post(f"/batches/{bid3}/abort")
+
+    # 快照含最终状态（B, 停用）-> 发布成功
+    bid4 = open_batch(client, 1, cutoff=0)
+    shard(client, bid4, 1, [{"outlet_no": "X", "district": "B", "active": False}])
+    r = publish(client, bid4, 0)
+    assert r.status_code == 200, r.text
+    row = [o for o in client.get("/outlets").json()["items"] if o["outlet_no"] == "X"][0]
+    assert row["district"] == "B" and row["active"] is False
+
+
+def test_interleaved_failure_keeps_old_version_and_blocked_chain(client):
+    # 发布与新变更交错：失败仍供旧版（含交错期间生效的变更），阻断序号不被跳过
+    bid = open_batch(client, 1, 0)
+    shard(client, bid, 1, [{"outlet_no": "X", "district": "A", "active": True}])
+    publish(client, bid, 0)
+
+    # 第二批上传期间，新变更交错到达：X 连续迁区 A->B->C 生效旧版；seq3 阻断，seq4 不得越过
+    bid2 = open_batch(client, 1, cutoff=0)
+    shard(client, bid2, 1, [{"outlet_no": "X", "district": "B", "active": True}])  # 快照只到中间态 B
+    change(client, 1, "move", "X", district="B")
+    change(client, 2, "move", "X", district="C")
+    r = change(client, 3, "deactivate", "GHOST")
+    assert r.json()["blocked"] is True
+    r = change(client, 4, "move", "X", district="D")
+    assert r.json()["applied"] is False and r.json()["blocked"] is False
+
+    # 发布失败（快照缺链尾 C）：整体回滚，旧版照常供数且保留交错期间生效的迁区
+    r = publish(client, bid2, 0)
+    assert r.status_code == 422 and r.json()["code"] == "SNAPSHOT_MISSING_LIVE_CHANGE"
+    body = client.get("/outlets").json()
+    assert body["version"] == 1
+    row = [o for o in body["items"] if o["outlet_no"] == "X"][0]
+    assert row["district"] == "C"
+    assert client.get("/health").json()["last_served_seq"] == 0
+    assert client.get("/batches/current").json()["batch_id"] == bid2
+
+    # 失败未改动变更应用状态：seq1/2 仍已应用，seq3 仍阻断，seq4 仍未应用且未越过断点
+    changes = {c["seq"]: c for c in client.get("/changes").json()["items"]}
+    assert changes[1]["applied"] and changes[2]["applied"]
+    assert changes[3]["blocked"] is True
+    assert changes[4]["applied"] is False and changes[4]["blocked"] is False
+
+    # 换正确快照（含链尾 C 与 GHOST）并追平到 4：断点解除，seq4 按序补套，不越号
+    client.post(f"/batches/{bid2}/abort")
+    bid3 = open_batch(client, 1, cutoff=0)
+    shard(client, bid3, 1, [
+        {"outlet_no": "X", "district": "C", "active": True},
+        {"outlet_no": "GHOST", "district": "Z", "active": True},
+    ])
+    r = publish(client, bid3, 4)
+    assert r.status_code == 200, r.text
+    assert r.json()["changes_applied"] == 4
+    outlets = {o["outlet_no"]: o for o in client.get("/outlets").json()["items"]}
+    assert outlets["X"]["district"] == "D"          # seq4 在断点解除后按序生效
+    assert outlets["GHOST"]["active"] is False      # seq3 阻断解除并生效
+    changes = {c["seq"]: c for c in client.get("/changes").json()["items"]}
+    assert all(c["applied"] and not c["blocked"] for c in changes.values())
+    assert client.get("/health").json()["last_served_seq"] == 4
+
+
+# ---------- 5b. 既有发布门禁 ----------
+
 def test_publish_blocked_by_missing_shards_and_gaps(client):
     bid = open_batch(client, 3, cutoff=0)
     shard(client, bid, 1, [{"outlet_no": "O1", "district": "A", "active": True}])

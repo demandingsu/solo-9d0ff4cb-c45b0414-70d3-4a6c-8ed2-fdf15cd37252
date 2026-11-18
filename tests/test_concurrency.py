@@ -126,3 +126,54 @@ def test_concurrent_open_batch_single_winner(svc):
 
     assert len(oks) == 1
     assert len(errors) == 7 and all(e.code == "OPEN_BATCH_EXISTS" for e in errors)
+
+
+def test_concurrent_publish_and_change_interleave_consistent(svc):
+    # 发布与新变更交错：两种串行顺序下，新版排口、变更应用状态与水位都必须一致
+    _open_and_publish_v1(svc)  # v1：O1 在 A
+
+    # 第二批快照已含 seq=1 的效果（O1 在 B），开批截止序号仍声明为 0
+    bid2 = svc.open_batch(OpenBatchRequest(total_shards=1, source_cutoff_seq=0))["batch_id"]
+    svc.submit_shard(
+        bid2,
+        ShardSubmitRequest(shard_no=1, items=[
+            OutletItem(outlet_no="O1", district="B", active=True),
+        ]),
+    )
+
+    change_req = ChangeRequest(seq=1, change_type="move", outlet_no="O1", district="B")
+    outcomes = {}
+
+    def do_change():
+        try:
+            outcomes["change"] = svc.submit_change(change_req)
+        except Exception as exc:  # noqa: BLE001
+            outcomes["change"] = exc
+
+    def do_publish():
+        try:
+            outcomes["publish"] = svc.publish_batch(bid2, PublishRequest(catch_up_seq=0))
+        except Exception as exc:  # noqa: BLE001
+            outcomes["publish"] = exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futs = [pool.submit(do_change), pool.submit(do_publish)]
+        for f in futs:
+            f.result()
+
+    # 变更先达：seq1 套旧版，发布门禁确认快照含其最终状态后换版；
+    # 发布先达：换版后 seq1 套新版。两种顺序终态一致。
+    assert isinstance(outcomes["change"], dict) and outcomes["change"]["applied"] is True
+    assert isinstance(outcomes["publish"], dict) and outcomes["publish"]["version"] == 2
+
+    outlets = svc.list_outlets(None, False, 500, 0)
+    assert outlets["version"] == 2
+    row = [o for o in outlets["items"] if o["outlet_no"] == "O1"][0]
+    assert row["district"] == "B" and row["active"] is True
+
+    changes = svc.list_changes(limit=10, offset=0)["items"]
+    assert len(changes) == 1 and changes[0]["seq"] == 1
+    assert changes[0]["applied"] is True and changes[0]["blocked"] is False
+
+    health = svc.health()
+    assert health["version"] == 2 and health["last_served_seq"] == 0

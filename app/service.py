@@ -6,6 +6,8 @@
 3. 变更序号必须连续，缺口之后的变更拒绝写入；已供出水位 last_served_seq 单调不减。
 4. 发布在单事务内完成：建新版排口 -> 套用窗口变更 -> 续套水位外变更 -> 删旧版 -> 推进水位，
    任一步失败整体回滚，旧版照常供数。
+5. 追平目标之外已生效的变更按排口归并整条链，只以其最终现役状态（区号+启停）作为
+   发布核对门槛：中间被覆盖的状态不逐项核对，最终状态真正遗漏仍拒绝换版。
 """
 from __future__ import annotations
 
@@ -502,34 +504,44 @@ def publish_batch(batch_id: int, req: PublishRequest) -> dict:
         changes_in_window = _replay_window(conn, new_version, cutoff, target)
 
         # 2b) 水位/追平目标之外、但已套到旧版现役清单的高序号变更：
-        #     新快照必须已包含其最终效果，否则换版会丢失现役状态，拒绝发布并整体回滚
+        #     同一排口可能先后多次变更（连续迁区、迁区后停用等），链上中间状态已被后续
+        #     变更覆盖，只有整条链的最终现役状态才是发布门槛：新快照（窗口重放后）该排口的
+        #     区号+启停须与旧版现役清单的最终状态一致；最终状态真正遗漏时仍拒绝，整体回滚。
         beyond = conn.execute(
             "SELECT * FROM change_log WHERE seq > ? AND applied=1 ORDER BY seq", (target,)
         ).fetchall()
+        # 按排口归并整条变更链：seq 升序遍历，后者覆盖前者，链尾即最终状态的代表变更
+        chain_tip: dict[str, sqlite3.Row] = {}
         for ch in beyond:
-            row = conn.execute(
-                "SELECT * FROM outlet WHERE version=? AND outlet_no=?",
-                (new_version, ch["outlet_no"]),
+            chain_tip[ch["outlet_no"]] = ch
+        for outlet_no, tip in chain_tip.items():
+            live = conn.execute(
+                "SELECT district, active FROM outlet WHERE version=? AND outlet_no=?",
+                (old_version, outlet_no),
             ).fetchone()
-            ok = False
-            if row is not None:
-                if ch["change_type"] == "add":
-                    ok = row["district"] == ch["district"] and bool(row["active"]) == bool(ch["active"])
-                elif ch["change_type"] == "move":
-                    ok = row["district"] == ch["district"]
-                elif ch["change_type"] == "deactivate":
-                    ok = row["active"] == 0
-            if not ok:
+            incoming = conn.execute(
+                "SELECT district, active FROM outlet WHERE version=? AND outlet_no=?",
+                (new_version, outlet_no),
+            ).fetchone()
+            kept = (
+                live is not None
+                and incoming is not None
+                and incoming["district"] == live["district"]
+                and incoming["active"] == live["active"]
+            )
+            if not kept:
                 raise ServiceError(
                     422,
                     "SNAPSHOT_MISSING_LIVE_CHANGE",
-                    f"新快照未包含已生效变更 seq={ch['seq']}（{ch['change_type']} {ch['outlet_no']}）的效果，"
-                    "请使用包含该变更的来源截止序号重新出快照",
-                    {"seq": ch["seq"], "outlet_no": ch["outlet_no"]},
+                    f"新快照未保留排口 {outlet_no} 已生效变更链（至 seq={tip['seq']}）的最终现役状态，"
+                    "请使用包含该变更最终效果的来源截止序号重新出快照",
+                    {"seq": tip["seq"], "outlet_no": outlet_no},
                 )
-            conn.execute(
-                "UPDATE change_log SET applied_version=? WHERE id=?", (new_version, ch["id"])
-            )
+        # 窗口外已生效变更的最终状态均已保留在新版：标记其在新版本上生效
+        conn.execute(
+            "UPDATE change_log SET applied_version=? WHERE seq > ? AND applied=1",
+            (new_version, target),
+        )
 
         # 3) 追平目标之外的未套用/阻断变更，在新版上续跑链条（遇断点即停，不越号）
         _continue_chain_new_version(conn, new_version, target)

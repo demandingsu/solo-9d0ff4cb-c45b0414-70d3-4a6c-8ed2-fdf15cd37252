@@ -28,8 +28,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements.txt
-pytest                      # 22 个单元/并发用例
-python3 tests/smoke_http.py # 需先启动服务，26 项 HTTP 端到端检查
+pytest                      # 27 个单元/并发用例
+python3 tests/smoke_http.py # 需先启动服务，34 项 HTTP 端到端检查
 ```
 
 ## 二、核心业务规则
@@ -66,7 +66,7 @@ python3 tests/smoke_http.py # 需先启动服务，26 项 HTTP 端到端检查
 | 分片必须齐全 | `422 MISSING_SHARDS`（返回待补片号） |
 | 截止序号之后至追平序号之间变更无缺号 | `422 CHANGE_SEQ_GAP`（返回待补序号） |
 | 窗口变更在新快照上可套用 | `422 PUBLISH_CHANGE_FAILED` |
-| 已生效的窗口外高序号变更，快照必须已含其效果 | `422 SNAPSHOT_MISSING_LIVE_CHANGE` |
+| 已生效的窗口外高序号变更，按排口取整条链的最终状态，快照必须已含该最终状态 | `422 SNAPSHOT_MISSING_LIVE_CHANGE` |
 
 发布在**单个 IMMEDIATE 事务**内完成：写入新版本快照 → 按序重放窗口 `(cutoff, catch_up_seq]` 内变更
 → 续跑窗口外未套用变更 → 删除旧版 → 推进版本号与水位 → 关闭批次。
@@ -108,9 +108,9 @@ app/
   service.py    # 全部业务规则与事务边界
   main.py       # FastAPI 路由与异常处理
 tests/
-  test_sync_api.py     # 18 个功能用例（含切换交错、失败回滚、阻断续链）
-  test_concurrency.py  # 4 个多线程并发用例（串行化、幂等、序号约束）
-  smoke_http.py        # 针对运行中服务的 26 项 HTTP 冒烟检查
+  test_sync_api.py     # 22 个功能用例（含切换交错、失败回滚、阻断续链、连续迁区链核对）
+  test_concurrency.py  # 5 个多线程并发用例（串行化、幂等、序号约束、发布/变更交错）
+  smoke_http.py        # 针对运行中服务的 34 项 HTTP 冒烟检查
 docker-compose.yml / Dockerfile
 ```
 
@@ -120,3 +120,6 @@ docker-compose.yml / Dockerfile
 - **并发控制**：所有写请求 `BEGIN IMMEDIATE` 串行化，配合 `busy_timeout=30s`；读请求只读连接，读写不互斥。
 - **版本隔离**：`outlet` 表带 `version` 字段，发布成功前旧版行不动，切换时同事务删旧插新。
 - **断点不越号**：变更链维护 `blocked/block_reason`，断点之后的变更保持未应用，缺号无法靠后续高序号“跳过”。
+- **链式变更按最终状态核对**：同一排口连续迁区/停用时，窗口外已生效变更按排口归并整条链，
+  只以其最终现役状态（区号+启停）作为发布门槛——已被后续变更覆盖的中间状态不逐项核对；
+  最终状态真正遗漏（如快照只到中间区、或漏了停用）仍拒绝换版，旧版照常供数。
